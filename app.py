@@ -119,8 +119,8 @@ def simulate_economy(
     prod = prod / (prod.mean() + 1e-12)
 
     # Automatability score ~ Beta (0..1). Higher = easier to automate.
-    a, b = beta_from_mean_conc(auto_mean, auto_conc)
-    auto = rng.beta(a, b, size=n)
+    aa, bb = beta_from_mean_conc(auto_mean, auto_conc)
+    auto = rng.beta(aa, bb, size=n)
 
     # Employment state
     employed = rng.random(n) > init_unemp
@@ -128,6 +128,7 @@ def simulate_economy(
     # State vars over time
     A = 0.0            # AI adoption / automated-task share
     K = 1.0            # capital index
+    Y0 = None          # store initial GDP for scaling capital accumulation
 
     yrs = np.arange(years + 1)
     gdp = np.zeros(years + 1)
@@ -165,15 +166,27 @@ def simulate_economy(
         Y = (human_output + ai_output) * tfp_from_capital(K) * scale
         gdp[t] = Y
 
+        # set baseline GDP once (for capital scaling)
+        if Y0 is None:
+            Y0 = Y + 1e-12
+
         # Employment
         emp_rate[t] = employed.mean()
 
         # AI share of output (rough)
-        ai_share[t] = (ai_output / (human_output + ai_output + 1e-12))
+        ai_share[t] = ai_output / (human_output + ai_output + 1e-12)
 
-        # Closed-economy split: savings → investment; rest → consumption
-        cons[t] = (1.0 - savings_rate) * Y
-        inv[t] = savings_rate * Y
+        # -----------------------------
+        # Macro identity (closed economy, no gov, no trade):
+        # Y = C + I
+        # Choose savings rate s, then:
+        # C = (1-s)Y
+        # I = sY  (and by definition S = Y - C = I)
+        # -----------------------------
+        C = (1.0 - savings_rate) * Y
+        I = savings_rate * Y
+        cons[t] = C
+        inv[t] = I
 
         # --- Transition to next period ---
         if t == years:
@@ -182,9 +195,7 @@ def simulate_economy(
         # 1) AI adoption update
         A_next = adoption_curve(A, ai_adoption_rate)
 
-        # 2) Displacement: among employed workers whose tasks fall in the automated set,
-        # a fraction replace_share are actually replaced; others are "augmented".
-        # Use next period adoption to compute new automated set (to capture incremental adoption).
+        # 2) Displacement using incremental adoption
         if A_next <= 0:
             automated_next = np.zeros(n, dtype=bool)
         else:
@@ -192,26 +203,27 @@ def simulate_economy(
             automated_next = auto >= cutoff_next
 
         newly_automated = automated_next & (~automated_mask)
-        # Displace employed in newly automated tasks with probability replace_share
         to_consider = newly_automated & employed
         if to_consider.any():
             displace_draw = rng.random(n) < replace_share
             displaced = to_consider & displace_draw
             employed[displaced] = False
 
-        # 3) Reskilling / re-entry: a fraction of unemployed return
+        # 3) Reskilling / re-entry
         unemployed_idx = np.where(~employed)[0]
         n_rehire = int(reskill_rate * len(unemployed_idx))
         if n_rehire > 0:
             rehired = rng.choice(unemployed_idx, size=n_rehire, replace=False)
             employed[rehired] = True
-            # Reskill effects
             auto[rehired] = np.clip(auto[rehired] * (1.0 - reskill_effect), 0.0, 1.0)
             prod[rehired] = prod[rehired] * (1.0 + upskill_gain)
 
-        # 4) Capital accumulation and (stylized) firm creation
-        K = (1.0 - dep_rate) * K + inv[t] / (Y + 1e-12)  # keep K scale stable-ish
-        firms = firms + firm_creation_rate * (inv[t] / firm_capital_cost)
+        # 4) Capital accumulation (simple + consistent scaling)
+        # K_{t+1} = (1-δ)K_t + I_t / Y0
+        K = (1.0 - dep_rate) * K + (I / Y0)
+
+        # (Optional stylized) firm creation proportional to investment dollars
+        firms = firms + firm_creation_rate * (I / firm_capital_cost)
 
         # 5) Update adoption
         A = A_next
@@ -383,10 +395,8 @@ with colB:
     st.metric("AI share of output (final year)", f"{100*ai_share[-1]:.1f}%")
 
     st.markdown("---")
-    st.caption(
-        "Toy model for intuition. Not a forecast. Change parameters to see how assumptions drive outcomes."
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.caption("Toy model for intuition. Not a forecast.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 with colA:
     tabs = st.tabs(["📈 GDP", "👷 Employment", "🧩 Components", "🧠 Model Notes"])
@@ -399,7 +409,7 @@ with colA:
             "GDP Over Time",
             "Trillions of USD"
         )
-        st.plotly_chart(fig, use_container_width=True)  # Streamlit supports Plotly natively [3](https://docs.streamlit.io/develop/api-reference/charts/st.plotly_chart)
+        st.plotly_chart(fig, use_container_width=True)
 
     with tabs[1]:
         fig2 = _nice_line(
@@ -410,7 +420,7 @@ with colA:
             "Percent"
         )
         fig2.update_yaxes(range=[0, 100])
-        st.plotly_chart(fig2, use_container_width=True)  # [3](https://docs.streamlit.io/develop/api-reference/charts/st.plotly_chart)
+        st.plotly_chart(fig2, use_container_width=True)
 
     with tabs[2]:
         fig3 = _nice_line(
@@ -420,7 +430,6 @@ with colA:
             "Macro Components",
             "T$ (and % for AI share)"
         )
-        # Put AI share on secondary axis feel without extra complexity: show as % in same plot.
         st.plotly_chart(fig3, use_container_width=True)
 
         st.markdown(
@@ -448,24 +457,17 @@ with colA:
   - Their productivity increases (**Upskill gain**)
   - Their automatability falls (**Reskill reduces automatability**)
 
-### Why you see different shapes
+### Macro bookkeeping (kept intentionally simple)
 
-This sandbox is basically exploring the “**displacement** vs **productivity**” trade-off
-common in task-based stories of automation and AI. [1](https://www.nber.org/system/files/working_papers/w24196/w24196.pdf)[2](https://economics.mit.edu/sites/default/files/publications/Automation%20and%20New%20Tasks%20-%20How%20Technology%20Displace.pdf)
+Closed economy, no government, no trade:
+- **GDP identity:** Y = C + I
+- Choose savings rate s:
+  - C = (1 - s)Y
+  - I = sY
+  - (So ex-post S = Y - C = I)
 
-### What’s missing (by design)
-
-No government, no taxes, no interest rates, no inflation, no trade, no sector splits.
-If you want, we can add:
-- wages vs profits split,
-- inequality (Gini),
-- sector buckets (routine vs non-routine),
-- policy levers (UI benefits, retraining spend),
-- endogenous “new task creation.”
-
-(Those features make it more realistic but also more assumptions-heavy.)
             """
         )
 
 st.divider()
-st.caption("Built with NumPy + Plotly + Streamlit. Inspired by interactive simulation teaching resources. rosimulation.org/)")
+st.caption("Built with NumPy + Plotly + Streamlit.")
